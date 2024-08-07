@@ -9,4 +9,6 @@ const router = express.Router();
 router.route("/create").post(validation(OV.createOrder), auth(), OC.createOrder);
 router.route("/cancel").post(validation(OV.cancleOrder), auth(), OC.cancleOrder);
 
+router.route('/webhook').post(express.raw({type: 'application/json'}),OC.webhook);
+
 export default router;
