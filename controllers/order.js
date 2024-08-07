@@ -6,6 +6,8 @@ import productModel from "../db/models/product.js";
 import cartModel from "../db/models/cart.js";
 import createInvoice from "../service/invoice.js";
 import { sendEmail } from "../service/sendEmail.js";
+import { payment } from "../service/payment.js";
+import Stripe from "stripe";
 
 export const createOrder = asyncHandler(async (req, res, next) => {
   const { productId, quantity, couponCode, address, phone, paymentMethod } =
@@ -92,60 +94,114 @@ export const createOrder = asyncHandler(async (req, res, next) => {
       city: "San Francisco",
       state: "CA",
       country: "US",
-      postal_code: 94111
+      postal_code: 94111,
     },
     items: order.products,
     subtotal: order.subPrice,
     paid: order.totalPrice,
     invoice_nr: order._id,
     date: order.createdAt,
-    coupon: req.body?.coupon?.amount || 0
+    coupon: req.body?.coupon?.amount || 0,
   };
   await createInvoice(invoice, "invoice.pdf");
-  
-  await sendEmail(req.user.email, "Order Placed", `your order has been placed successfully`, [
-    {
-      path: "invoice.pdf",
-      contentType: "application/pdf"
-    },
-    {
-      path: "route.jpeg",
-      contentType: "image/pdf"
+
+  await sendEmail(
+    req.user.email,
+    "Order Placed",
+    `your order has been placed successfully`,
+    [
+      {
+        path: "invoice.pdf",
+        contentType: "application/pdf",
+      },
+      {
+        path: "route.jpeg",
+        contentType: "image/pdf",
+      },
+    ]
+  );
+
+  if (paymentMethod == "card") {
+    const stripe = new Stripe(process.env.stripe_secret);
+
+    if(req.body?.coupon){
+      const coupon = await stripe.coupons.create({
+        percent_off: req.body.coupon.amount,
+        duration: "once"
+      })
+      req.body.couponId = coupon.id
     }
-  ])
+
+    const seasion = await payment({
+      payment_method_types: ["card"],
+      mode: "payment",
+      customer_email: req.user.email,
+      metadata: {
+        orderId: order._id.toString(),
+      },
+      success_url: `${req.protocol}://${req.headers.host}/order/success/${order._id}`,
+      cancel_url: `${req.protocol}://${req.headers.host}/order/cancel/${order._id}`,
+      line_items: order.products.map((product) => {
+        return {
+          price_data: {
+            currency: "egp",
+            product_data: {
+              name: product.name,
+            },
+            unit_amount: product.price * 100,
+          },
+          quantity: product.quantity,
+        };
+      }),
+      discounts: req.body?.coupon ? [{coupon: req.body.couponId}] : [],
+    });
+    return res.status(200).json({msg: "done", url: seasion.url})
+  }
 
   return res.status(200).json({ msg: "done", order });
 });
 
 export const cancleOrder = asyncHandler(async (req, res, next) => {
-  const {id} = req.params
-  const {reason} = req.body
+  const { id } = req.params;
+  const { reason } = req.body;
 
-  const order = await orderModel.findOne({_id: id, user: req.user._id})
-  if(!order){
-    next(new appError("order not found", 404))
+  const order = await orderModel.findOne({ _id: id, user: req.user._id });
+  if (!order) {
+    next(new appError("order not found", 404));
   }
-  if((order.paymentMethod === "cash" && order.status != "placed") || (order.paymentMethod === "card" && order.status != "waitPayment")){
-    next(new appError("cannot cancel this order", 400))
-  }
-
-  await orderModel.updateOne({_id: id}, {
-    status: "cancelled",
-    cancelledBy: req.user._id,
-    reason
-  })
-
-  if(order?.couponId){
-    await couponModel.updateOne({_id: order.couponId}, {
-      $pull: {usedBy: req.user._id}
-    })
+  if (
+    (order.paymentMethod === "cash" && order.status != "placed") ||
+    (order.paymentMethod === "card" && order.status != "waitPayment")
+  ) {
+    next(new appError("cannot cancel this order", 400));
   }
 
-  for(const product of order.products){
-    await productModel.updateOne({_id: product.productId}, {
-      $inc: {stock: product.quantity}
-    })
+  await orderModel.updateOne(
+    { _id: id },
+    {
+      status: "cancelled",
+      cancelledBy: req.user._id,
+      reason,
+    }
+  );
+
+  if (order?.couponId) {
+    await couponModel.updateOne(
+      { _id: order.couponId },
+      {
+        $pull: { usedBy: req.user._id },
+      }
+    );
   }
 
-  res.status(204).json({msg: "done"})
-})
+  for (const product of order.products) {
+    await productModel.updateOne(
+      { _id: product.productId },
+      {
+        $inc: { stock: product.quantity },
+      }
+    );
+  }
+
+  res.status(204).json({ msg: "done" });
+});
